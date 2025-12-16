@@ -208,7 +208,59 @@ def plot_tsne(features_before, labels,title_before="t-SNE Before Training"):
                         markerscale=0.6, fontsize=5, frameon=True)
     plt.savefig(args.output_dir+"optimized", dpi=300, bbox_inches='tight')
     plt.close()
+def compute_con_loss(inputs_test,
+                       score_test,
+                       score_near,
+                       score_nn,
+                       score_far,
+                       perturbations,
+                       features_test,
+                       pseudo_label,
+                       args,
+                       alpha):
+    K=args.K
+    device=score_test.device
+    mask = torch.ones((inputs_test.shape[0], inputs_test.shape[0]))
+    self_diag_vals = torch.diag(mask)
+    non_self_mask = torch.diag_embed(self_diag_vals)
+    far_mask = mask - non_self_mask
+    score_transpose = score_test.T
+    far_dot_prod = score_test @ score_transpose
+    far_dot_sum = ((far_dot_prod ** 2) * far_mask.cuda()).sum(-1)
+    far_pred_mean = torch.mean(far_dot_sum)
+    p = score_test.unsqueeze(1).expand(-1, K, -1)
+    q_near = score_near.to(device)  # [B, K, C]
+    q_far = score_far.to(device)  # [B, K, C]
+    tau=args.temperature
 
+    pos_per = F.kl_div(p, q_near, reduction="none").sum(-1).sum(1) / tau  # [B]
+    pos_rev_per = F.kl_div(q_near, p, reduction="none").sum(-1).sum(1) / tau  # [B]
+    far_per = F.kl_div(p, q_far, reduction="none").sum(-1).sum(1) / tau  # [B]
+
+    den_term = args.alpha1 * pos_rev_per - args.alpha2 * far_per  # [B]
+    numerator = torch.exp(pos_per)  # [B]
+    denominator = torch.exp(den_term)  # [B]
+    loss = torch.log(numerator / denominator)  # [B]
+    loss_perturbations = 0.0
+    for pert in perturbations:
+        loss_perturbations += torch.mean(
+            (F.kl_div(pert.unsqueeze(1).expand(-1, args.K, -1).cuda(),
+                      score_near.cuda(), reduction="none").sum(-1)).sum(1)
+        )
+    # loss_perturbations = loss_perturbations / num_perturbations
+    # === Feature Loss () ===
+    loss = torch.mean(
+        (F.kl_div(score_test.unsqueeze(1).expand(-1, args.K, -1).cuda(),
+                  score_near.cuda(), reduction="none").sum(-1)).sum(1) / tau
+    ) - args.alpha1 * loss_perturbations \
+           - args.alpha1 * torch.mean(
+        (F.kl_div(score_near.cuda(),
+                  score_test.unsqueeze(1).expand(-1, args.K, -1).cuda(), reduction="none").sum(-1)).sum(1) / tau
+    ) + args.alpha2 * torch.mean(
+        (F.kl_div(score_test.unsqueeze(1).expand(-1, args.K, -1).cuda(),
+                  score_far.cuda(), reduction="none").sum(-1)).sum(1) / tau
+    ) + far_pred_mean * alpha
+    return loss
 def train_target(args):
     dset_loaders = data_load(args)
     ## set base network
@@ -447,19 +499,11 @@ def train_target(args):
                               score_near.cuda(), reduction="none").sum(-1)).sum(1)
                 )
             # loss_perturbations = loss_perturbations / num_perturbations
+            loss = compute_con_loss(inputs_test, score_test, score_near, score_nn, score_far, perturbations,
+                                    features_test, pseudo_label, args, alpha)
 
             # === Feature Loss () ===
-            loss = torch.mean(
-                (F.kl_div(score_test.unsqueeze(1).expand(-1, args.K, -1).cuda(),
-                          score_near.cuda(), reduction="none").sum(-1)).sum(1)
-            ) - args.alpha1 * loss_perturbations \
-                   - args.alpha1 * torch.mean(
-                (F.kl_div(score_near.cuda(),
-                          score_test.unsqueeze(1).expand(-1, args.K, -1).cuda(), reduction="none").sum(-1)).sum(1)
-            ) + args.alpha2 * torch.mean(
-                (F.kl_div(score_test.unsqueeze(1).expand(-1, args.K, -1).cuda(),
-                          score_far.cuda(), reduction="none").sum(-1)).sum(1)
-            ) + far_pred_mean * alpha
+
 
             # === Pseudo-label Loss (pse) ===
             K = args.K
@@ -483,6 +527,7 @@ def train_target(args):
                 loss_pl = loss_pl / ncl_count
 
             loss += args.lam * loss_pl
+      
 
             optimizer.zero_grad()
             optimizer_c.zero_grad()
@@ -595,6 +640,7 @@ if __name__ == "__main__":
     parser.add_argument("--alpha_decay", default=True)
     parser.add_argument("--nuclear", default=False, action="store_true")
     parser.add_argument("--var", default=False, action="store_true")
+ 
     args = parser.parse_args()
     if args.dset == "office-home":
         names = ["Art", "Clipart", "Product", "RealWorld"]
@@ -631,7 +677,7 @@ if __name__ == "__main__":
             os.mkdir(args.output_dir)
 
         args.out_file = open(
-            osp.join(args.output_dir, "NeRD.txt".format(args.seed)), "w"  )
+            osp.join(args.output_dir, "pl1.txt".format(args.seed)), "w"  )
         args.out_file.write(print_args(args) + "\n")
         args.out_file.flush()
 
